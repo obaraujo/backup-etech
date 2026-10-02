@@ -1,0 +1,2 @@
+# mantem CRLF no raw do GitHub (cmd le melhor .bat com CRLF)
+*.bat -text
