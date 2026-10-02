@@ -279,25 +279,78 @@ function Invoke-PgDump($dumps, $srv, $porta, $usuario, $senha, $banco, $arq, $lo
     return $null
 }
 
-function Copiar($origem, $destino, $filtro, [switch]$Recursivo, [string[]]$ExcluirPastas) {
-    if (-not (Test-Path $origem)) { return }
-    $a = @($origem, $destino) + $filtro + @('/R:1', '/W:1', '/NP', '/NFL', '/NDL', '/NJH', '/NJS', '/XJ')
-    if ($Recursivo) { $a += '/E' }
-    if ($ExcluirPastas) { $a += '/XD'; $a += $ExcluirPastas }
-    & "$env:SystemRoot\System32\robocopy.exe" @a | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy falhou (codigo $LASTEXITCODE) em $origem" }
+# Adiciona a $lista os arquivos de $origem que batem com $filtros, sem copiar nada:
+# cada item e { Origem = caminho real; Nome = caminho dentro do zip (sob $pastaZip) }.
+# Ignora junctions/links (como o /XJ do robocopy) e as pastas de $ExcluirPastas.
+function Adicionar($lista, $origem, $pastaZip, $filtros, [switch]$Recursivo, [string[]]$ExcluirPastas) {
+    if (-not (Test-Path -LiteralPath $origem)) { return }
+    $raiz = New-Object IO.DirectoryInfo ((Get-Item -LiteralPath $origem).FullName)
+    $pendentes = New-Object Collections.Stack
+    $pendentes.Push(@($raiz, $pastaZip))
+    while ($pendentes.Count -gt 0) {
+        $dir, $rel = $pendentes.Pop()
+        try {
+            $vistos = @{}
+            foreach ($f in $filtros) {
+                foreach ($arq in $dir.GetFiles($f)) {
+                    # GetFiles('*.ini') tambem pega '.inix': confere de novo com -like
+                    if ($arq.Name -notlike $f -or $vistos.ContainsKey($arq.Name)) { continue }
+                    $vistos[$arq.Name] = 1
+                    $nome = if ($rel) { "$rel\$($arq.Name)" } else { $arq.Name }
+                    $lista.Add((New-Object PSObject -Property @{ Origem = $arq.FullName; Nome = $nome }))
+                }
+            }
+            if (-not $Recursivo) { continue }
+            foreach ($sub in $dir.GetDirectories()) {
+                if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($ExcluirPastas -contains $sub.Name) { continue }
+                $subRel = if ($rel) { "$rel\$($sub.Name)" } else { $sub.Name }
+                $pendentes.Push(@($sub, $subRel))
+            }
+        } catch {
+            Log "  AVISO: nao foi possivel listar $($dir.FullName): $($_.Exception.Message)"
+        }
+    }
 }
 
-function Compactar($pasta, $zip) {
-    $seteZip = @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe") |
-        Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($seteZip) {
-        & $seteZip a -tzip -mx=5 -bd $zip "$pasta\*" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "7-Zip falhou (codigo $LASTEXITCODE)" }
-        return
+# Grava o zip lendo cada arquivo direto do lugar de origem: tudo de $pasta (dump do banco,
+# logs, LEIA-ME) + os itens de $lista. Arquivo que nao puder ser lido e pulado com aviso.
+# Retorna quantos arquivos foram pulados.
+function Compactar($pasta, $lista, $zip) {
+    Add-Type -AssemblyName System.IO.Compression
+    $todos = @()
+    $base = (Get-Item -LiteralPath $pasta).FullName.TrimEnd('\')
+    foreach ($a in [IO.Directory]::GetFiles($base, '*', 'AllDirectories')) {
+        $todos += New-Object PSObject -Property @{ Origem = $a; Nome = $a.Substring($base.Length + 1) }
     }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [IO.Compression.ZipFile]::CreateFromDirectory($pasta, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+    $todos += $lista
+
+    $pulados = 0
+    $fs = [IO.File]::Open($zip, 'Create', 'ReadWrite', 'None')
+    $za = New-Object IO.Compression.ZipArchive -ArgumentList $fs, ([IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($a in $todos) {
+            # ReadWrite: le tambem arquivo que o sistema esta com aberto para gravacao (ex.: logs)
+            try { $src = [IO.File]::Open($a.Origem, 'Open', 'Read', 'ReadWrite') }
+            catch {
+                Log "  AVISO: arquivo nao incluido (em uso?): $($a.Origem)"
+                $pulados++
+                continue
+            }
+            try {
+                $e = $za.CreateEntry($a.Nome.Replace('\', '/'), [IO.Compression.CompressionLevel]::Optimal)
+                try { $e.LastWriteTime = [IO.File]::GetLastWriteTime($a.Origem) } catch {}
+                $dst = $e.Open()
+                try { $src.CopyTo($dst) } finally { $dst.Dispose() }
+            } finally {
+                $src.Dispose()
+            }
+        }
+    } finally {
+        $za.Dispose()
+        $fs.Dispose()
+    }
+    $pulados
 }
 
 function Tamanho($bytes) { '{0:N1} MB' -f ($bytes / 1MB) }
@@ -333,6 +386,7 @@ foreach ($item in $insts) {
     Log "--- $inst ($erp)"
     try {
         New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        $arquivos = New-Object 'Collections.Generic.List[object]'   # entram no zip direto da origem
         $resumo = @(
             "Sistema    : $erp",
             "Instalacao : $inst",
@@ -390,14 +444,14 @@ foreach ($item in $insts) {
             }
 
             # ----- arquivos -----
-            Copiar $inst $staging '*.ini'
-            Copiar (Join-Path $inst 'Report')      (Join-Path $staging 'Report')      '*.fr3' -Recursivo
-            Copiar (Join-Path $inst 'Certificado') (Join-Path $staging 'Certificado') @('*.pfx', '*.p12') -Recursivo
-            Copiar (Join-Path $inst 'Logo')        (Join-Path $staging 'Logo')        '*.*'   -Recursivo
+            Adicionar $arquivos $inst '' '*.ini'
+            Adicionar $arquivos (Join-Path $inst 'Report')      'Report'      '*.fr3' -Recursivo
+            Adicionar $arquivos (Join-Path $inst 'Certificado') 'Certificado' @('*.pfx', '*.p12') -Recursivo
+            Adicionar $arquivos (Join-Path $inst 'Logo')        'Logo'        '*'     -Recursivo
             if ($INCLUIR_XML) {
                 Get-ChildItem $inst -Filter 'XML*' -ErrorAction SilentlyContinue |
                     Where-Object { $_.PSIsContainer } |
-                    ForEach-Object { Copiar $_.FullName (Join-Path $staging $_.Name) '*.*' -Recursivo }
+                    ForEach-Object { Adicionar $arquivos $_.FullName $_.Name '*' -Recursivo }
             }
         } else {
             # =========================== CUMMINS ===========================
@@ -445,19 +499,19 @@ foreach ($item in $insts) {
             }
 
             # ----- arquivos -----
-            Copiar $inst $staging '*.ini'
+            Adicionar $arquivos $inst '' '*.ini'
             Get-ChildItem $inst -Filter 'CONF*' -ErrorAction SilentlyContinue |
                 Where-Object { $_.PSIsContainer } |
-                ForEach-Object { Copiar $_.FullName (Join-Path $staging $_.Name) '*.*' -Recursivo }
-            Copiar (Join-Path $inst 'Report')     (Join-Path $staging 'Report')     '*.fr3' -Recursivo
-            Copiar (Join-Path $inst 'Relatorios') (Join-Path $staging 'Relatorios') '*.*'   -Recursivo
-            Copiar (Join-Path $inst 'Imagens')    (Join-Path $staging 'Imagens')    '*.*'   -Recursivo
+                ForEach-Object { Adicionar $arquivos $_.FullName $_.Name '*' -Recursivo }
+            Adicionar $arquivos (Join-Path $inst 'Report')     'Report'     '*.fr3' -Recursivo
+            Adicionar $arquivos (Join-Path $inst 'Relatorios') 'Relatorios' '*'     -Recursivo
+            Adicionar $arquivos (Join-Path $inst 'Imagens')    'Imagens'    '*'     -Recursivo
             foreach ($p in 'Certificado', 'Certificados') {
-                Copiar (Join-Path $inst $p) (Join-Path $staging $p) @('*.pfx', '*.p12') -Recursivo
+                Adicionar $arquivos (Join-Path $inst $p) $p @('*.pfx', '*.p12') -Recursivo
             }
             if ($INCLUIR_XML) {
                 foreach ($p in 'NFe', 'NFCe', 'CFeVenda', 'CFeCanc') {
-                    Copiar (Join-Path $inst $p) (Join-Path $staging $p) '*.*' -Recursivo -ExcluirPastas 'Schemas'
+                    Adicionar $arquivos (Join-Path $inst $p) $p '*' -Recursivo -ExcluirPastas 'Schemas'
                 }
             }
         }
@@ -466,9 +520,10 @@ foreach ($item in $insts) {
         # ----- compacta (em temp\ e so depois move para upload\) -----
         $zipNome = "backup_${nome}_$dataHora.zip"
         $zipTemp = Join-Path $dirTemp $zipNome
-        Compactar $staging $zipTemp
+        $pulados = Compactar $staging $arquivos $zipTemp
         Move-Item $zipTemp (Join-Path $dirUpload $zipNome) -Force
-        Log "  OK zip: $zipNome ($(Tamanho (Get-Item (Join-Path $dirUpload $zipNome)).Length))"
+        $aviso = if ($pulados) { ", $pulados arquivo(s) nao incluido(s)" } else { '' }
+        Log "  OK zip: $zipNome ($(Tamanho (Get-Item (Join-Path $dirUpload $zipNome)).Length), $($arquivos.Count) arquivos$aviso)"
     } catch {
         Log "  ERRO: $($_.Exception.Message)"
         $falhas++

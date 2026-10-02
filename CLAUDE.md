@@ -74,10 +74,16 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
   `Relatorios\`, `Imagens\`, `Certificado\` e `Certificados\` (`*.pfx` e `*.p12`), `NFe\`, `NFCe\`,
   `CFeVenda\`, `CFeCanc\` (sem as pastas `Schemas`) e `LEIA-ME_backup.txt`. Ficam de fora `BKP\` (backups
   antigos, centenas de MB), `Suporte\`, DLLs e executáveis.- **Volume:** na máquina de dev, `NFCe\NFCeVenda` tem ~19 mil XMLs (234 MB). O zip fica com ~167 MB e leva
-  ~3 min.
+  ~1min45 (eram ~3min20 quando os arquivos eram copiados para `temp\` antes de compactar).
 
 ### Comum
 
+- **Compactação sem cópia:** `Adicionar` só monta a lista de arquivos (origem + nome no zip) e `Compactar` grava o
+  zip (`ZipArchive` do .NET) lendo cada arquivo direto da instalação. Em `temp\<instalacao>\` ficam só o dump do
+  banco, o log do gbak/pg_dump e o `LEIA-ME`. Não usa mais robocopy nem 7-Zip.
+- **Arquivo que não abre** (bloqueio exclusivo de outro processo): é pulado, com `AVISO` no log e a contagem na
+  linha `OK zip`. Não conta como falha. Arquivos abertos para gravação (logs) são lidos normalmente
+  (`FileShare.ReadWrite`).
 - **Upload e histórico:** 1 zip por instalação em `C:\E-Tech\Backups\upload\` (só o mais recente). No início
   de cada execução, os anteriores vão para `historico\`, que é limpo após `RETENCAO_DIAS` (7).
 - **Logs:**
