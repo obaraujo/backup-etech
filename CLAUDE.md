@@ -1,6 +1,12 @@
 # backup-etech
 
-Backup automático das instalações do sistema TSD (Host/Frente, Firebird 2.5) nos clientes da E-Tech.
+Backup automático das instalações dos ERPs nos clientes da E-Tech:
+- **TSD** (Host/Frente, Firebird 2.5)
+- **Cummins** (PostgreSQL 9.2)
+
+Cada ERP tem um ramo próprio no laço principal (`if ($erp -eq 'TSD') { ... } else { ... }`). O resto é comum
+a todos: lock, upload/histórico, zip, `LEIA-ME`, logs e códigos de saída. `Get-Erp` identifica o sistema pelo
+arquivo de configuração da pasta.
 Quem executa é o aplicativo de backup **MasterRemote**: ele roda um BAT ("BAT antes do backup") e depois
 faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`).
 
@@ -26,7 +32,8 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
   `-NoProfile -ExecutionPolicy Bypass -Command ... Invoke-Expression`.
 - **Nada pode vir antes do batch que dependa da 1ª linha.** O truque híbrido `<# : ... #>` foi abandonado
   porque quebra quando entra qualquer coisa antes da primeira linha (`@echo off`, BOM).
-- **Arquivos .bat em ASCII puro** (sem acentos, sem BOM), com CRLF.
+- **Arquivos .bat em ASCII puro** (sem acentos, sem BOM), com CRLF. Não usar `sed -i` do Git Bash neles: ele
+  converte CRLF para LF.
 - **gbak: só versão 2.5.x** (filtrado por `FileVersion`), com `fbclient.dll` na mesma pasta. Um `.fbk` gerado
   pelo gbak 3+ não restaura no 2.5. Ordem de procura: serviço Firebird rodando > pasta da instalação >
   registro > Program Files. Se um gbak falhar, tenta o próximo.
@@ -35,16 +42,42 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
   outro Firebird (ex.: 3.0 na mesma máquina) e dá "connection rejected by remote interface".
 - **`Conexao.ini`:** ler só a seção `[CONEXAO]` (`IP_SERVIDOR`, `PORTA`, `RETAGUARDA`). Existe um `Porta=COM1`
   em `[BALANCA]`.
+- **Cummins: só `pg_dump` 9.2.x** (`$PG_VERSAO`, filtrado por `pg_dump --version`). Um `.backup` gerado por
+  `pg_dump` mais novo não restaura com o `pg_restore` 9.2, e a máquina pode ter outro PostgreSQL (na de dev há
+  o 16 na 5434). Ordem de procura: `EDCAMINHOPGDUMP` do `CONF\CONFIGURACAO.XML` > serviço PostgreSQL >
+  registro (`PostgreSQL\Installations`) > Program Files.
+- **Cummins: `pg_dump` sempre com `-w`** e a senha em `PGPASSWORD`. Sem `-w`, se a senha falhar, ele fica
+  esperando digitação para sempre (roda como SYSTEM, sem console).
+- **Cummins: terminais também têm PostgreSQL local**, com um banco `CUMMINS` vazio (instalação padrão). Por
+  isso o que decide se é terminal é o `Server` do `SERVER.XML`, nunca a existência do banco local.
 
 ## Comportamento definido com o usuário
+
+### TSD
 
 - **Detecção:** pastas com `Conexao.ini` em `X:\TSD` e `X:\TSD\*`, em todos os discos fixos. `C:\TSD-FIXO`
   existe só na máquina de desenvolvimento; nos clientes é sempre `TSD`.
 - **IP_SERVIDOR local** (127.0.0.1/localhost/nome/IPs da máquina/vazio): faz o gbak. Se for de **outra máquina**
   (terminal), pula o banco e salva só os arquivos.
 - **Banco já feito:** se duas instalações apontam para o mesmo `RETAGUARDA`, o gbak roda uma vez só.
-- **Conteúdo do zip:** `.fbk`, `*.ini`, `Report\*.fr3`, `Certificado\*.pfx`, `Logo\`, todas as pastas `XML*`
+- **Conteúdo do zip:** `.fbk`, `*.ini`, `Report\*.fr3`, `Certificado\*.pfx` e `*.p12`, `Logo\`, todas as pastas `XML*`
   e `LEIA-ME_backup.txt`.
+### Cummins
+
+- **Detecção:** `X:\Cummins` com `CONF\SERVER.XML`, em todos os discos fixos. Só a raiz: as subpastas têm
+  cópias antigas de `CONF` (ex.: `BKP\BD\CONF`).
+- **Conexão:** primeira `ROW` do `CONF\SERVER.XML` (atributos `Server`, `Banco`, `Usuario`, `Senha`,
+  `Porta`). Padrão: `localhost`, `postgres`, `5432`.
+- **Server local:** faz o `pg_dump -F c` (`<Banco>.backup`). Se for de outra máquina (terminal), salva só os
+  arquivos. O banco já feito usa a chave `porta + nome do banco`.
+- **Conteúdo do zip:** `<Banco>.backup`, `pg_dump.log`, `*.ini`, todas as pastas `CONF*`, `Report\*.fr3`,
+  `Relatorios\`, `Imagens\`, `Certificado\` e `Certificados\` (`*.pfx` e `*.p12`), `NFe\`, `NFCe\`,
+  `CFeVenda\`, `CFeCanc\` (sem as pastas `Schemas`) e `LEIA-ME_backup.txt`. Ficam de fora `BKP\` (backups
+  antigos, centenas de MB), `Suporte\`, DLLs e executáveis.- **Volume:** na máquina de dev, `NFCe\NFCeVenda` tem ~19 mil XMLs (234 MB). O zip fica com ~167 MB e leva
+  ~3 min.
+
+### Comum
+
 - **Upload e histórico:** 1 zip por instalação em `C:\E-Tech\Backups\upload\` (só o mais recente). No início
   de cada execução, os anteriores vão para `historico\`, que é limpo após `RETENCAO_DIAS` (7).
 - **Logs:**
@@ -81,8 +114,14 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
 - **Bootstrap:** dá para testar sem GitHub usando
   `URL=file:///C:/Baraujo-Soft/backup-etech/backup-etech.bat` (o `curl.exe` aceita `file://`).
 - **Conferir o `.fbk`:** restaurar com `gbak -c ... 127.0.0.1/3050:<pasta>\teste.fdb`.
+- **Cummins:** `C:\Cummins` real (`Server=localhost`, `Banco=CUMMINS`, `postgres`/`123`, porta 5432),
+  PostgreSQL 9.2 na 5432 e 16 na 5434.
+- **Conferir o `.backup`:** `createdb cummins_teste_restore`, depois
+  `pg_restore -d cummins_teste_restore <arquivo>.backup` (9.2, porta 5432), comparar a contagem de tabelas e
+  rodar `dropdb`.
 
 ## Pendências
 
 - URL raw (já configurada no bootstrap): https://raw.githubusercontent.com/obaraujo/backup-etech/main/backup-etech.bat (repo público obaraujo/backup-etech, branch main).
 - Ainda não foi validado de ponta a ponta no MasterRemote real com o bootstrap.
+- Cummins: validado só na máquina de dev (v2). Falta validar num cliente real e num terminal Cummins.

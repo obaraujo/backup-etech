@@ -1,4 +1,4 @@
-:: VERSAO=1
+:: VERSAO=2
 @echo off
 setlocal
 :: =====================================================================
@@ -22,12 +22,22 @@ exit /b %RC%
 
 :PS_INICIO
 # =====================================================================
-#  BACKUP AUTOMATICO E-TECH  -  Host / Frente (Firebird 2.5)
+#  BACKUP AUTOMATICO E-TECH
 #
+#  TSD (Host / Frente, Firebird 2.5)
 #  - Detecta as instalacoes (pastas com Conexao.ini) em X:\TSD e X:\TSD\*
 #  - Banco: gbak 2.5 via servidor local (seguro com o sistema aberto).
 #    Terminais (IP_SERVIDOR de outra maquina) nao fazem backup do banco.
-#  - Arquivos: *.ini, Report\*.fr3, Certificado\*.pfx, Logo\, pastas XML*
+#  - Arquivos: *.ini, Report\*.fr3, Certificado\*.pfx e *.p12, Logo\, pastas XML*
+#
+#  CUMMINS (PostgreSQL 9.2)
+#  - Detecta X:\Cummins com CONF\SERVER.XML (Server, Banco, Usuario, Senha, Porta)
+#  - Banco: pg_dump 9.2 (formato custom, .backup; restaurar com pg_restore 9.2).
+#    Terminais (Server de outra maquina) nao fazem backup do banco.
+#  - Arquivos: *.ini, CONF*\, Report\, Relatorios\, Imagens\,
+#    Certificado(s)\*.pfx e *.p12,
+#    NFe\, NFCe\, CFeVenda\, CFeCanc\ (sem as pastas Schemas)
+#
 #  - Gera 1 zip por instalacao em <DESTINO>\upload (so o mais recente).
 #    Os anteriores vao para <DESTINO>\historico e sao apagados apos
 #    RETENCAO_DIAS.
@@ -43,8 +53,10 @@ if (-not $DESTINO) { $DESTINO = 'C:\E-Tech\Backups' }
 $RETENCAO_DIAS = 7
 $FB_USER       = 'SYSDBA'
 $FB_PASS       = 'masterkey'
+$PG_VERSAO     = '9.2'   # so usa pg_dump desta versao: dump de pg_dump mais novo nao restaura no 9.2
 $INCLUIR_XML   = $true
 $PASTAS_FIXAS  = @()     # opcional, ex.: @('D:\Sistema\Host') - desliga a deteccao automatica
+                         # (o sistema e identificado pelo Conexao.ini ou CONF\SERVER.XML)
 # ---------------------------------------------------------------------
 
 $ErrorActionPreference = 'Continue'
@@ -78,6 +90,13 @@ try {
 
 # ----------------------------- FUNCOES -------------------------------
 
+function Get-Erp($pasta) {
+    if (Test-Path (Join-Path $pasta 'Conexao.ini'))     { return 'TSD' }
+    if (Test-Path (Join-Path $pasta 'CONF\SERVER.XML')) { return 'CUMMINS' }
+    return $null
+}
+
+# Retorna objetos { Pasta; Erp }
 function Get-Instalacoes {
     if ($PASTAS_FIXAS.Count -gt 0) {
         $cand = $PASTAS_FIXAS
@@ -85,16 +104,23 @@ function Get-Instalacoes {
         $cand = @()
         foreach ($drv in [IO.DriveInfo]::GetDrives()) {
             if ($drv.DriveType -ne 'Fixed' -or -not $drv.IsReady) { continue }
-            foreach ($nome in @('TSD')) {
-                $raiz = Join-Path $drv.RootDirectory.FullName $nome
-                if (-not (Test-Path $raiz)) { continue }
+            $r = $drv.RootDirectory.FullName
+            # TSD: X:\TSD e X:\TSD\*
+            $raiz = Join-Path $r 'TSD'
+            if (Test-Path $raiz) {
                 $cand += $raiz
                 $cand += Get-ChildItem $raiz -ErrorAction SilentlyContinue |
                     Where-Object { $_.PSIsContainer } | ForEach-Object { $_.FullName }
             }
+            # Cummins: so X:\Cummins (as subpastas tem copias antigas de CONF, ex.: BKP\)
+            $raiz = Join-Path $r 'Cummins'
+            if (Test-Path $raiz) { $cand += (Get-Item $raiz).FullName }
         }
     }
-    $cand | Where-Object { Test-Path (Join-Path $_ 'Conexao.ini') } | Sort-Object -Unique
+    $cand | Sort-Object -Unique | ForEach-Object {
+        $erp = Get-Erp $_
+        if ($erp) { New-Object PSObject -Property @{ Pasta = $_; Erp = $erp } }
+    }
 }
 
 function Read-Conexao($ini) {
@@ -169,10 +195,95 @@ function Invoke-Gbak($gbaks, $fdb, $porta, $fbk, $logGbak) {
     return $null
 }
 
-function Copiar($origem, $destino, $filtro, [switch]$Recursivo) {
+# Cummins: 1a linha de CONF\SERVER.XML (Server, Banco, Usuario, Senha, Porta)
+function Read-ServerXml($xmlPath) {
+    $cfg = @{}
+    $row = ([xml][IO.File]::ReadAllText($xmlPath)).DATAPACKET.ROWDATA.ROW | Select-Object -First 1
+    if ($row) { foreach ($a in $row.Attributes) { $cfg[$a.Name.ToUpper()] = $a.Value.Trim() } }
+    $cfg
+}
+
+# Cummins: valor TEXTO de uma opcao do CONF\CONFIGURACAO.XML
+function Read-ConfigCummins($inst, $nome) {
+    $xmlPath = Join-Path $inst 'CONF\CONFIGURACAO.XML'
+    if (-not (Test-Path $xmlPath)) { return '' }
+    try {
+        $row = ([xml][IO.File]::ReadAllText($xmlPath)).SelectSingleNode("//ROW[@NOME='$nome']")
+        if ($row) { return $row.GetAttribute('TEXTO') }
+    } catch {}
+    return ''
+}
+
+function Get-VersaoPgDump($p) {
+    try { "$(& $p --version 2>$null)" } catch { '' }
+}
+
+# Lista os pg_dump.exe da versao $PG_VERSAO, por prioridade:
+# configurado no Cummins > servico PostgreSQL > registro > Program Files
+function Get-PgDumpCandidatos($pastaInst) {
+    $lista = @()
+    $cfgDump = Read-ConfigCummins $pastaInst 'EDCAMINHOPGDUMP'
+    if ($cfgDump) { $lista += $cfgDump }
+    $svcs = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.PathName -match '(pg_ctl|postgres)\.exe' } |
+        Sort-Object { $_.State -ne 'Running' }
+    foreach ($s in $svcs) {
+        if ($s.PathName -match '^"?(.+?\\)[^\\]+\.exe') { $lista += $matches[1] + 'pg_dump.exe' }
+    }
+    foreach ($k in 'HKLM:\SOFTWARE\PostgreSQL\Installations', 'HKLM:\SOFTWARE\WOW6432Node\PostgreSQL\Installations') {
+        Get-ChildItem $k -ErrorAction SilentlyContinue | ForEach-Object {
+            $b = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).'Base Directory'
+            if ($b) { $lista += Join-Path $b 'bin\pg_dump.exe' }
+        }
+    }
+    foreach ($pf in $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432,
+                    'C:\Arquivos de Programas', 'C:\Arquivos de Programas (x86)') {
+        if (-not $pf -or -not (Test-Path (Join-Path $pf 'PostgreSQL'))) { continue }
+        $lista += Get-ChildItem (Join-Path $pf 'PostgreSQL') -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSIsContainer } |
+            ForEach-Object { Join-Path $_.FullName 'bin\pg_dump.exe' }
+    }
+
+    $vistos = @{}
+    $versaoRe = '\) ' + [regex]::Escape($PG_VERSAO) + '\.'
+    foreach ($p in $lista) {
+        if (-not $p -or -not (Test-Path $p)) { continue }
+        $chave = $p.ToUpper()
+        if ($vistos.ContainsKey($chave)) { continue }
+        $vistos[$chave] = 1
+        if ((Get-VersaoPgDump $p) -notmatch $versaoRe) { continue }
+        $p
+    }
+}
+
+# Tenta cada pg_dump ate um funcionar. Retorna o pg_dump usado ou $null.
+function Invoke-PgDump($dumps, $srv, $porta, $usuario, $senha, $banco, $arq, $logDump) {
+    if (-not $porta)   { $porta = '5432' }
+    if (-not $usuario) { $usuario = 'postgres' }
+    $env:PGPASSWORD = $senha
+    try {
+        foreach ($p in $dumps) {
+            Remove-Item $arq, $logDump -Force -ErrorAction SilentlyContinue
+            Log "  pg_dump: $p"
+            # -w: nunca pede senha (rodando como SYSTEM, ficaria travado esperando)
+            $saida = & $p -w -h $srv -p $porta -U $usuario -F c -b -f $arq $banco 2>&1
+            $rc = $LASTEXITCODE
+            $saida | ForEach-Object { "$_" } | Set-Content $logDump
+            if ($rc -eq 0 -and (Test-Path $arq) -and (Get-Item $arq).Length -gt 0) { return $p }
+            $erro = (Get-Content $logDump -ErrorAction SilentlyContinue | Select-Object -Last 4) -join ' | '
+            Log "  falhou (codigo $rc): $erro"
+        }
+    } finally {
+        Remove-Item Env:\PGPASSWORD -ErrorAction SilentlyContinue
+    }
+    return $null
+}
+
+function Copiar($origem, $destino, $filtro, [switch]$Recursivo, [string[]]$ExcluirPastas) {
     if (-not (Test-Path $origem)) { return }
-    $a = @($origem, $destino, $filtro, '/R:1', '/W:1', '/NP', '/NFL', '/NDL', '/NJH', '/NJS', '/XJ')
+    $a = @($origem, $destino) + $filtro + @('/R:1', '/W:1', '/NP', '/NFL', '/NDL', '/NJH', '/NJS', '/XJ')
     if ($Recursivo) { $a += '/E' }
+    if ($ExcluirPastas) { $a += '/XD'; $a += $ExcluirPastas }
     & "$env:SystemRoot\System32\robocopy.exe" @a | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy falhou (codigo $LASTEXITCODE) em $origem" }
 }
@@ -202,11 +313,11 @@ Get-ChildItem $dirTemp -ErrorAction SilentlyContinue | Remove-Item -Recurse -For
 
 $insts = @(Get-Instalacoes)
 if ($insts.Count -eq 0) {
-    Log 'Nenhuma instalacao encontrada (pasta com Conexao.ini em X:\TSD\*).'
+    Log 'Nenhuma instalacao encontrada (Conexao.ini em X:\TSD\* ou CONF\SERVER.XML em X:\Cummins).'
     $lock.Close()
     exit 2
 }
-Log ("Instalacoes: " + ($insts -join '; '))
+Log ("Instalacoes: " + (($insts | ForEach-Object { "$($_.Pasta) ($($_.Erp))" }) -join '; '))
 
 $nomesLocais = @('', '127.0.0.1', 'localhost', '::1', $env:COMPUTERNAME)
 try { $nomesLocais += [Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | ForEach-Object { $_.IPAddressToString } } catch {}
@@ -214,74 +325,141 @@ try { $nomesLocais += [Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | ForEach-O
 $bancosFeitos = @{}
 $falhas = 0
 
-foreach ($inst in $insts) {
+foreach ($item in $insts) {
+    $inst    = $item.Pasta
+    $erp     = $item.Erp
     $nome    = (($inst -replace ':', '') -replace '\\', '_').Trim('_')
     $staging = Join-Path $dirTemp $nome
-    Log "--- $inst"
+    Log "--- $inst ($erp)"
     try {
         New-Item -ItemType Directory -Path $staging -Force | Out-Null
-        $cfg   = Read-Conexao (Join-Path $inst 'Conexao.ini')
-        $ip    = "$($cfg['IP_SERVIDOR'])".Trim()
-        $porta = "$($cfg['PORTA'])".Trim()
-        $fdb   = "$($cfg['RETAGUARDA'])".Trim()
-        if (-not $fdb) { $fdb = Join-Path $inst 'HOST.FDB' }
-
         $resumo = @(
+            "Sistema    : $erp",
             "Instalacao : $inst",
             "Computador : $env:COMPUTERNAME",
             "Versao     : v$env:VERSAO",
-            "Data       : $dataHora",
-            "IP_SERVIDOR: $ip  PORTA: $porta",
-            "RETAGUARDA : $fdb"
+            "Data       : $dataHora"
         )
 
-        # ----- banco -----
-        if ($nomesLocais -notcontains $ip) {
-            Log "  Banco em outro servidor ($ip): terminal, backup do banco ignorado."
-            $resumo += 'Banco      : ignorado (terminal)'
-        } elseif ($fdb.StartsWith('\\')) {
-            Log "  Banco em caminho de rede ($fdb): backup do banco ignorado."
-            $resumo += 'Banco      : ignorado (caminho de rede)'
-        } elseif (-not (Test-Path $fdb)) {
-            Log "  ERRO: banco nao encontrado: $fdb"
-            $resumo += 'Banco      : NAO ENCONTRADO'
-            $falhas++
-        } elseif ($bancosFeitos.ContainsKey($fdb.ToUpper())) {
-            Log "  Banco ja incluido no backup de $($bancosFeitos[$fdb.ToUpper()])."
-            $resumo += "Banco      : incluido em backup_$($bancosFeitos[$fdb.ToUpper()])_$dataHora.zip"
-        } else {
-            $tamFdb = (Get-Item $fdb).Length
-            $livre  = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($DESTINO))).AvailableFreeSpace
-            if ($livre -lt $tamFdb * 1.5) { Log "  AVISO: pouco espaco livre ($(Tamanho $livre)) para banco de $(Tamanho $tamFdb)." }
+        if ($erp -eq 'TSD') {
+            # ============================= TSD =============================
+            $cfg   = Read-Conexao (Join-Path $inst 'Conexao.ini')
+            $ip    = "$($cfg['IP_SERVIDOR'])".Trim()
+            $porta = "$($cfg['PORTA'])".Trim()
+            $fdb   = "$($cfg['RETAGUARDA'])".Trim()
+            if (-not $fdb) { $fdb = Join-Path $inst 'HOST.FDB' }
+            $resumo += "IP_SERVIDOR: $ip  PORTA: $porta"
+            $resumo += "RETAGUARDA : $fdb"
 
-            $gbaks = @(Get-GbakCandidatos $inst)
-            $fbk   = Join-Path $staging ([IO.Path]::GetFileNameWithoutExtension($fdb) + '.fbk')
-            $usado = $null
-            if ($gbaks.Count -eq 0) {
-                Log '  ERRO: nenhum gbak 2.5 (com fbclient.dll) encontrado na maquina.'
-            } else {
-                $usado = Invoke-Gbak $gbaks $fdb $porta $fbk (Join-Path $staging 'gbak.log')
-            }
-            if ($usado) {
-                $bancosFeitos[$fdb.ToUpper()] = $nome
-                Log "  OK banco: $(Tamanho $tamFdb) -> fbk $(Tamanho (Get-Item $fbk).Length)"
-                $resumo += "Banco      : $([IO.Path]::GetFileName($fbk)) (gbak $(Get-VersaoArquivo $usado) - $usado)"
-            } else {
-                Log '  ERRO: backup do banco falhou.'
-                $resumo += 'Banco      : FALHOU (ver gbak.log)'
+            # ----- banco -----
+            if ($nomesLocais -notcontains $ip) {
+                Log "  Banco em outro servidor ($ip): terminal, backup do banco ignorado."
+                $resumo += 'Banco      : ignorado (terminal)'
+            } elseif ($fdb.StartsWith('\\')) {
+                Log "  Banco em caminho de rede ($fdb): backup do banco ignorado."
+                $resumo += 'Banco      : ignorado (caminho de rede)'
+            } elseif (-not (Test-Path $fdb)) {
+                Log "  ERRO: banco nao encontrado: $fdb"
+                $resumo += 'Banco      : NAO ENCONTRADO'
                 $falhas++
-            }
-        }
+            } elseif ($bancosFeitos.ContainsKey($fdb.ToUpper())) {
+                Log "  Banco ja incluido no backup de $($bancosFeitos[$fdb.ToUpper()])."
+                $resumo += "Banco      : incluido em backup_$($bancosFeitos[$fdb.ToUpper()])_$dataHora.zip"
+            } else {
+                $tamFdb = (Get-Item $fdb).Length
+                $livre  = (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($DESTINO))).AvailableFreeSpace
+                if ($livre -lt $tamFdb * 1.5) { Log "  AVISO: pouco espaco livre ($(Tamanho $livre)) para banco de $(Tamanho $tamFdb)." }
 
-        # ----- arquivos -----
-        Copiar $inst $staging '*.ini'
-        Copiar (Join-Path $inst 'Report')      (Join-Path $staging 'Report')      '*.fr3' -Recursivo
-        Copiar (Join-Path $inst 'Certificado') (Join-Path $staging 'Certificado') '*.pfx' -Recursivo
-        Copiar (Join-Path $inst 'Logo')        (Join-Path $staging 'Logo')        '*.*'   -Recursivo
-        if ($INCLUIR_XML) {
-            Get-ChildItem $inst -Filter 'XML*' -ErrorAction SilentlyContinue |
+                $gbaks = @(Get-GbakCandidatos $inst)
+                $fbk   = Join-Path $staging ([IO.Path]::GetFileNameWithoutExtension($fdb) + '.fbk')
+                $usado = $null
+                if ($gbaks.Count -eq 0) {
+                    Log '  ERRO: nenhum gbak 2.5 (com fbclient.dll) encontrado na maquina.'
+                } else {
+                    $usado = Invoke-Gbak $gbaks $fdb $porta $fbk (Join-Path $staging 'gbak.log')
+                }
+                if ($usado) {
+                    $bancosFeitos[$fdb.ToUpper()] = $nome
+                    Log "  OK banco: $(Tamanho $tamFdb) -> fbk $(Tamanho (Get-Item $fbk).Length)"
+                    $resumo += "Banco      : $([IO.Path]::GetFileName($fbk)) (gbak $(Get-VersaoArquivo $usado) - $usado)"
+                } else {
+                    Log '  ERRO: backup do banco falhou.'
+                    $resumo += 'Banco      : FALHOU (ver gbak.log)'
+                    $falhas++
+                }
+            }
+
+            # ----- arquivos -----
+            Copiar $inst $staging '*.ini'
+            Copiar (Join-Path $inst 'Report')      (Join-Path $staging 'Report')      '*.fr3' -Recursivo
+            Copiar (Join-Path $inst 'Certificado') (Join-Path $staging 'Certificado') @('*.pfx', '*.p12') -Recursivo
+            Copiar (Join-Path $inst 'Logo')        (Join-Path $staging 'Logo')        '*.*'   -Recursivo
+            if ($INCLUIR_XML) {
+                Get-ChildItem $inst -Filter 'XML*' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSIsContainer } |
+                    ForEach-Object { Copiar $_.FullName (Join-Path $staging $_.Name) '*.*' -Recursivo }
+            }
+        } else {
+            # =========================== CUMMINS ===========================
+            $cfg     = Read-ServerXml (Join-Path $inst 'CONF\SERVER.XML')
+            $srv     = "$($cfg['SERVER'])".Trim()
+            $porta   = "$($cfg['PORTA'])".Trim()
+            $banco   = "$($cfg['BANCO'])".Trim()
+            $usuario = "$($cfg['USUARIO'])".Trim()
+            $senha   = "$($cfg['SENHA'])"
+            if (-not $srv) { $srv = 'localhost' }
+            $resumo += "SERVER     : $srv  PORTA: $porta"
+            $resumo += "BANCO      : $banco  USUARIO: $usuario"
+            $chaveBanco = "PG|$porta|$banco".ToUpper()
+
+            # ----- banco -----
+            if ($nomesLocais -notcontains $srv) {
+                Log "  Banco em outro servidor ($srv): terminal, backup do banco ignorado."
+                $resumo += 'Banco      : ignorado (terminal)'
+            } elseif (-not $banco) {
+                Log '  ERRO: nome do banco vazio no CONF\SERVER.XML.'
+                $resumo += 'Banco      : NAO CONFIGURADO'
+                $falhas++
+            } elseif ($bancosFeitos.ContainsKey($chaveBanco)) {
+                Log "  Banco ja incluido no backup de $($bancosFeitos[$chaveBanco])."
+                $resumo += "Banco      : incluido em backup_$($bancosFeitos[$chaveBanco])_$dataHora.zip"
+            } else {
+                $dumps = @(Get-PgDumpCandidatos $inst)
+                $arq   = Join-Path $staging ($banco + '.backup')
+                $usado = $null
+                if ($dumps.Count -eq 0) {
+                    Log "  ERRO: nenhum pg_dump $PG_VERSAO encontrado na maquina."
+                } else {
+                    $usado = Invoke-PgDump $dumps $srv $porta $usuario $senha $banco $arq (Join-Path $staging 'pg_dump.log')
+                }
+                if ($usado) {
+                    $bancosFeitos[$chaveBanco] = $nome
+                    Log "  OK banco: $banco -> backup $(Tamanho (Get-Item $arq).Length)"
+                    $resumo += "Banco      : $([IO.Path]::GetFileName($arq)) ($(Get-VersaoPgDump $usado), formato custom - $usado)"
+                    $resumo += "Restaurar  : pg_restore $PG_VERSAO -U postgres -C -d postgres $([IO.Path]::GetFileName($arq))"
+                } else {
+                    Log '  ERRO: backup do banco falhou.'
+                    $resumo += 'Banco      : FALHOU (ver pg_dump.log)'
+                    $falhas++
+                }
+            }
+
+            # ----- arquivos -----
+            Copiar $inst $staging '*.ini'
+            Get-ChildItem $inst -Filter 'CONF*' -ErrorAction SilentlyContinue |
                 Where-Object { $_.PSIsContainer } |
                 ForEach-Object { Copiar $_.FullName (Join-Path $staging $_.Name) '*.*' -Recursivo }
+            Copiar (Join-Path $inst 'Report')     (Join-Path $staging 'Report')     '*.fr3' -Recursivo
+            Copiar (Join-Path $inst 'Relatorios') (Join-Path $staging 'Relatorios') '*.*'   -Recursivo
+            Copiar (Join-Path $inst 'Imagens')    (Join-Path $staging 'Imagens')    '*.*'   -Recursivo
+            foreach ($p in 'Certificado', 'Certificados') {
+                Copiar (Join-Path $inst $p) (Join-Path $staging $p) @('*.pfx', '*.p12') -Recursivo
+            }
+            if ($INCLUIR_XML) {
+                foreach ($p in 'NFe', 'NFCe', 'CFeVenda', 'CFeCanc') {
+                    Copiar (Join-Path $inst $p) (Join-Path $staging $p) '*.*' -Recursivo -ExcluirPastas 'Schemas'
+                }
+            }
         }
         Set-Content -Path (Join-Path $staging 'LEIA-ME_backup.txt') -Value $resumo
 
