@@ -1,15 +1,20 @@
+:: VERSAO=1
 @echo off
 setlocal
 :: =====================================================================
 ::  BACKUP AUTOMATICO E-TECH - parte BAT (so chama o PowerShell abaixo)
 ::  Executado pelo campo "BAT antes do backup" (campo-bat-antes.bat),
-::  que baixa este arquivo para C:\E-Tech\backup-etech.bat
+::  que baixa este arquivo para C:\E-Tech\Suporte\backup-etech.bat
+::  A cada alteracao publicada, AUMENTE o numero em VERSAO (linha 1):
+::  o campo so atualiza os clientes quando a versao do GitHub e maior.
 :: =====================================================================
 set "DESTINO=C:\E-Tech\Backups"
 set "SCRIPT=%~f0"
+set VERSAO=0
+for /f "tokens=2 delims==" %%a in ('findstr /b /c:":: VERSAO=" "%~f0"') do set "VERSAO=%%a"
 if not exist "%DESTINO%" mkdir "%DESTINO%"
 
->> "%DESTINO%\bat_execucao.txt" echo [%date% %time%] BAT iniciado - usuario %USERNAME% - arquivo "%SCRIPT%"
+>> "%DESTINO%\bat_execucao.txt" echo [%date% %time%] BAT v%VERSAO% iniciado - usuario %USERNAME% - arquivo "%SCRIPT%"
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -Command "try { $c=[IO.File]::ReadAllText($env:SCRIPT); $i=$c.IndexOf(':PS'+'_INICIO'); if ($i -lt 0) { throw 'marcador PS_INICIO nao encontrado' }; $i=$c.IndexOf([char]10,$i)+1; Invoke-Expression $c.Substring($i) } catch { Add-Content -Path ($env:DESTINO+'\bat_execucao.txt') -Value ('ERRO PowerShell: '+$_); exit 9 }"
 set RC=%ERRORLEVEL%
 >> "%DESTINO%\bat_execucao.txt" echo [%date% %time%] BAT finalizado - codigo %RC%
@@ -188,7 +193,7 @@ function Tamanho($bytes) { '{0:N1} MB' -f ($bytes / 1MB) }
 
 # ------------------------------ EXECUCAO -----------------------------
 
-Log '==================== INICIO ===================='
+Log "==================== INICIO (v$env:VERSAO) ===================="
 
 # o ultimo backup sai de upload\ e vai para o historico
 Get-ChildItem $dirUpload -Filter *.zip -ErrorAction SilentlyContinue |
@@ -224,6 +229,7 @@ foreach ($inst in $insts) {
         $resumo = @(
             "Instalacao : $inst",
             "Computador : $env:COMPUTERNAME",
+            "Versao     : v$env:VERSAO",
             "Data       : $dataHora",
             "IP_SERVIDOR: $ip  PORTA: $porta",
             "RETAGUARDA : $fdb"

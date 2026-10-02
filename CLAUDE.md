@@ -7,8 +7,8 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
 ## Arquivos
 
 - `campo-bat-antes.bat`: conteúdo colado no campo "BAT antes do backup" do MasterRemote. Baixa o
-  `backup-etech.bat` do GitHub (raw) para `C:\E-Tech\backup-etech.bat` e o executa com `call`. Se o download
-  falhar, usa a cópia local. Só troca a cópia local se o arquivo baixado contiver `:PS_INICIO`.
+  `backup-etech.bat` do GitHub (raw) para `C:\E-Tech\Suporte\backup-etech.bat` e o executa com `call`. Só troca a cópia local quando a
+  versão baixada é maior que a local (ver Versionamento). Se o download falhar, usa a cópia local.
 - `backup-etech.bat`: o script real. Topo em batch puro e, depois do rótulo `:PS_INICIO`, PowerShell. O batch
   lê o próprio arquivo, pega o texto depois do marcador e roda com `Invoke-Expression`.
 - `.gitattributes`: `*.bat -text`, para o raw do GitHub servir com CRLF.
@@ -17,7 +17,7 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
 
 - **O campo do MasterRemote salva só ~1.535 caracteres.** O excedente é descartado e o app acrescenta `cls` e
   `Exit` ao final. O editor mostra o texto inteiro, mas não grava. Por isso o campo contém só o bootstrap, que
-  precisa continuar bem abaixo desse limite (hoje tem 542 caracteres).
+  precisa continuar bem abaixo desse limite (hoje tem 955 caracteres).
 - **Execução pelo MasterRemote:** como SYSTEM (`USERNAME` = `MAQUINA$`), a partir de um .bat temporário em
   `C:\Program Files (x86)\MasterRemote\<numero>.bat`. O app pode apagar esse arquivo durante a execução, e aí
   o código de saída final pode vir 1 mesmo com sucesso. O log é a fonte de verdade.
@@ -53,6 +53,21 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
 - **Códigos de saída:** 0 ok, 1 falha, 2 nenhuma instalação, 3 já em execução, 9 erro no PowerShell,
   8 (bootstrap) script não disponível.
 
+## Versionamento
+
+- A **linha 1** do `backup-etech.bat` é `:: VERSAO=<inteiro>`. Ela tem que ficar no início da linha, porque é lida com
+  `findstr /b`.
+- **Toda alteração publicada precisa aumentar esse número.** O bootstrap só atualiza um cliente quando a
+  versão do GitHub é maior que a local. Sem aumentar, os clientes continuam na versão antiga.
+- **Proteções do bootstrap:**
+  - arquivo baixado sem `VERSAO` (página de erro, por exemplo) vale 0 e nunca substitui a cópia local;
+  - versão do GitHub menor que a local não faz downgrade;
+  - cópia local sem `VERSAO` vale 0, então qualquer versão publicada substitui.
+- **Onde a versão aparece:** `bat_execucao.txt` (`BAT v<N> iniciado`, `script atualizado v<A> para v<B>`),
+  `backup_log.txt` (`INICIO (v<N>)`) e `LEIA-ME_backup.txt` dentro do zip.
+- **Atenção em testes:** não deixar uma versão de teste maior que a publicada em `C:\E-Tech\Suporte\`. Se
+  isso acontecer, a máquina recusa as atualizações reais até o GitHub passar desse número.
+
 ## Como testar (máquina de dev)
 
 - Ambiente: Firebird 2.5 na 3050 e 3.0 na 3060. Instalações `C:\TSD\Host` e `C:\TSD\Host2`; o `Conexao.ini`
@@ -69,5 +84,5 @@ faz upload dos arquivos de "Arquivos e pastas" (`C:\E-Tech\Backups\upload\*.zip`
 
 ## Pendências
 
-- Colocar no `campo-bat-antes.bat` a URL raw do GitHub (`set "URL=..."`); hoje está `SEU-LINK-AQUI`.
+- URL raw (já configurada no bootstrap): https://raw.githubusercontent.com/obaraujo/backup-etech/main/backup-etech.bat (repo público obaraujo/backup-etech, branch main).
 - Ainda não foi validado de ponta a ponta no MasterRemote real com o bootstrap.
